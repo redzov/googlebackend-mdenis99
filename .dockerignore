@@ -1,0 +1,45 @@
+# Dependencies
+node_modules
+frontend/node_modules
+
+# Build artifacts
+dist
+build
+.next
+
+# Development
+.env.local
+.env.development
+.env.test
+*.log
+npm-debug.log*
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Tests
+coverage
+.nyc_output
+
+# Docs
+*.md
+docs
+
+# Frontend (built separately)
+frontend

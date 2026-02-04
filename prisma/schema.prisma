@@ -1,0 +1,204 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// API ключи для клиентов
+model Key {
+  id          String    @id @default(cuid())
+  keyId       String    @unique // KEY-XXXXX-XX format
+  key         String    @unique // actual API key
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  quotaUsed   Int       @default(0)
+  quotaLimit  Int       @default(100)
+  note        String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  accounts Account[]
+  apiLogs  ApiLog[]
+
+  @@index([workspaceId])
+  @@index([createdAt])
+}
+
+// Созданные аккаунты Google
+model Account {
+  id            String        @id @default(cuid())
+  status        AccountStatus @default(AVAILABLE)
+  email         String        @unique
+  password      String
+  recovery      String?
+  workspaceId   String
+  workspace     Workspace     @relation(fields: [workspaceId], references: [id])
+  proxyUsed     String?       // Использованный прокси при создании
+  fingerprintId String?       // ID профиля GoLogin
+  issuedTo      String?       // Key ID or "Manual"
+  issuedAt      DateTime      @default(now())
+  keyId         String?
+  key           Key?          @relation(fields: [keyId], references: [id])
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  creationLogs CreationLog[]
+
+  @@index([status])
+  @@index([workspaceId])
+  @@index([keyId])
+  @@index([createdAt])
+  @@index([issuedAt])
+}
+
+enum AccountStatus {
+  AVAILABLE // доступен для выдачи
+  ISSUED    // выдан, рабочий
+  BAD       // выдан, не рабочий
+}
+
+// Домены Google Workspace
+model Workspace {
+  id              String         @id @default(cuid())
+  domain          String         @unique
+  recoveryEmailId String?
+  recoveryEmail   RecoveryEmail? @relation(fields: [recoveryEmailId], references: [id])
+  note            String?
+
+  // Google Workspace credentials (JSON file content)
+  serviceAccountJson String? @db.Text
+  adminEmail         String? // Admin email for domain-wide delegation
+
+  // Static Proxy for Admin API (one IP per workspace)
+  // This proxy is used for creating accounts via Google Admin API
+  // Each workspace should have its own dedicated static IP
+  staticProxyHost     String?
+  staticProxyPort     Int?
+  staticProxyUsername String?
+  staticProxyPassword String?
+  staticProxyProtocol String?  @default("http") // http, socks5
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts     Account[]
+  keys         Key[]
+  creationLogs CreationLog[]
+
+  @@index([recoveryEmailId])
+  @@index([createdAt])
+}
+
+// Резервные почты для верификации
+model RecoveryEmail {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  imapHost  String   @default("imap.gmail.com")
+  imapPort  Int      @default(993)
+  imapUser  String
+  imapPass  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspaces Workspace[]
+}
+
+// Логи API запросов
+model ApiLog {
+  id        String   @id @default(cuid())
+  logId     String   @unique // LOG-XXXXX-XX format
+  keyId     String?
+  key       Key?     @relation(fields: [keyId], references: [id])
+  endpoint  String
+  method    String
+  status    Int
+  latencyMs Int
+  message   String?
+  request   Json?
+  response  Json?
+  createdAt DateTime @default(now())
+
+  @@index([keyId])
+  @@index([status])
+  @@index([endpoint])
+  @@index([createdAt])
+}
+
+// Глобальные настройки
+model Settings {
+  id                String   @id @default("main")
+
+  // GoLogin API
+  goLoginApiKey     String?  // API Token from GoLogin dashboard
+  goLoginHeadless   Boolean  @default(true)  // Run browser in headless mode (required for servers)
+
+  // Webshare Rotating Proxy
+  proxyHost         String?  @default("p.webshare.io")
+  proxyPort         Int?     @default(80)
+  proxyUsername     String?  // e.g. iidwhezeresidential-rotate
+  proxyPassword     String?  // Webshare proxy password
+  proxyProtocol     String?  @default("socks5")
+
+  // Legacy fields (kept for compatibility)
+  proxyApiKey       String?
+  proxyApiUrl       String?  // URL для Proxy API
+  fingerprintApiKey String?
+  fingerprintApiUrl String?  // URL для GoLogin/Fingerprint API
+
+  defaultPassword   String   @default("ChangeMe123!")
+  threads           Int      @default(1)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+// Админ пользователь
+model Admin {
+  id        String   @id @default(cuid())
+  username  String   @unique
+  password  String   // hashed
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Логи создания аккаунтов (детальное отслеживание)
+model CreationLog {
+  id            String           @id @default(cuid())
+  logId         String           @unique // CLOG-XXXXX-XX format
+  workspaceId   String
+  workspace     Workspace        @relation(fields: [workspaceId], references: [id])
+  accountId     String?          // Связь с созданным аккаунтом (если успешно)
+  account       Account?         @relation(fields: [accountId], references: [id])
+  status        CreationStatus   @default(PENDING)
+  currentStep   String?          // Текущий шаг процесса
+  email         String?          // Email создаваемого аккаунта
+  proxyUsed     String?          // Использованный прокси
+  fingerprintId String?          // ID профиля GoLogin
+  error         String?          // Сообщение об ошибке
+  durationMs    Int?             // Общая длительность в миллисекундах
+  stepDurations Json?            // Длительность каждого шага
+  createdBy     String           @default("Manual") // "Manual" или ID ключа
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@index([workspaceId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([createdBy])
+}
+
+enum CreationStatus {
+  PENDING          // В очереди на создание
+  CREATING         // Создание через Google Admin API
+  BROWSER_AUTH     // Авторизация в браузере
+  ADDING_RECOVERY  // Добавление recovery email
+  WAITING_OTP      // Ожидание OTP кода на почту
+  CONFIRMING_OTP   // Ввод OTP кода в браузере
+  SUCCESS          // Успешно создан
+  FAILED           // Ошибка на одном из шагов
+}

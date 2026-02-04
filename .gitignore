@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+
+# Environment (NEVER commit these!)
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+prisma/dev.db
+
+# Prisma
+prisma/migrations/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code settings (contains tokens)
+.claude/
+
+# Build
+dist/
+build/
+
+# Google credentials (sensitive!)
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!frontend/package.json
+!frontend/package-lock.json
+
+# Test files with hardcoded data
+test_*.js
+check_*.js
+cleanup_*.js
+
+# Screenshots (may contain sensitive data)
+screenshots/
+*.png
+!frontend/public/*.png
+
+# Test
+coverage/
