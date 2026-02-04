@@ -207,24 +207,33 @@ export default async function manualRoutes(fastify, options) {
       where: { id: 'main' }
     });
 
+    // Check GoLogin API connection
+    let goLoginApiStatus = false;
+    if (settings?.goLoginApiKey) {
+      try {
+        const { getGoLoginService } = await import('../services/goLoginService.js');
+        const goLoginService = getGoLoginService(settings);
+        const result = await goLoginService.testConnection();
+        goLoginApiStatus = result.success;
+      } catch (error) {
+        console.warn('GoLogin API check failed:', error.message);
+        goLoginApiStatus = false;
+      }
+    }
+
     const status = {
-      googleApi: true, // Always available if workspace configured
-      // NEW: Check for Webshare proxy OR legacy proxy config
-      proxyApi: !!(settings?.proxyHost && settings?.proxyUsername) || !!(settings?.proxyApiKey && settings?.proxyApiUrl),
-      // NEW: Check for GoLogin OR legacy fingerprint config
-      goLoginApi: !!settings?.goLoginApiKey,
-      fingerprintApi: !!(settings?.fingerprintApiKey && settings?.fingerprintApiUrl),
+      googleApi: true, // Checked per-workspace when creating accounts
+      proxyApi: !!(settings?.proxyHost && settings?.proxyUsername && settings?.proxyPassword),
+      goLoginApi: goLoginApiStatus,
       redis: await isRedisAvailable().catch(() => false),
       threads: settings?.threads || 1
     };
 
-    const hasBrowserAutomation = status.goLoginApi || status.fingerprintApi;
-
     return {
       status,
-      mode: hasBrowserAutomation ? 'full' : 'simple',
-      description: hasBrowserAutomation
-        ? `Full 7-step process with ${status.goLoginApi ? 'GoLogin' : 'Fingerprint'} browser automation`
+      mode: status.goLoginApi ? 'full' : 'simple',
+      description: status.goLoginApi
+        ? 'Full 7-step process with GoLogin browser automation'
         : 'Simple Google Admin SDK only (no browser verification)'
     };
   });

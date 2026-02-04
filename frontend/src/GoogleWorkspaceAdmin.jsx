@@ -1278,8 +1278,8 @@ export default function GoogleWorkspaceAdmin({ user, onLogout }) {
                 <span className="text-sm text-gray-200">Proxy API</span>
               </div>
               <div className="flex items-center gap-2">
-                {manualStatus.status?.fingerprintApi ? <CircleCheck className="h-4 w-4 text-green-400" /> : <AlertTriangle className="h-4 w-4 text-yellow-400" />}
-                <span className="text-sm text-gray-200">Fingerprint API</span>
+                {manualStatus.status?.goLoginApi ? <CircleCheck className="h-4 w-4 text-green-400" /> : <AlertTriangle className="h-4 w-4 text-yellow-400" />}
+                <span className="text-sm text-gray-200">GoLogin API</span>
               </div>
               <div className="flex items-center gap-2">
                 {manualStatus.status?.redis ? <CircleCheck className="h-4 w-4 text-green-400" /> : <AlertTriangle className="h-4 w-4 text-yellow-400" />}
