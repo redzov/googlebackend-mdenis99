@@ -298,19 +298,21 @@ export class AccountCreationFullService {
       const gwService = await createWorkspaceService(workspace);
       const defaultPassword = settings?.defaultPassword || 'ChangeMe123!';
 
+      // Recovery email is NOT added via API per client requirements
+      // It should only be added via browser for "natural" account behavior
       const result = await gwService.createUser(
         workspace.domain,
         defaultPassword,
-        workspace.recoveryEmail?.email
+        null // Recovery email добавляется ТОЛЬКО через браузер!
       );
       stepDurations.googleApi = Date.now() - stepStart;
 
-      // Save to database
+      // Save to database (store recovery email for later browser addition)
       const account = await this.prisma.account.create({
         data: {
           email: result.email,
           password: defaultPassword,
-          recovery: workspace.recoveryEmail?.email || null,
+          recovery: workspace.recoveryEmail?.email || null, // Store for browser step
           workspaceId: workspace.id,
           status: 'AVAILABLE',
           issuedTo: creationLog.createdBy,
@@ -374,12 +376,12 @@ export class AccountCreationFullService {
       if (hasWebshareProxy) {
         const proxyService = getProxyService(settings);
 
-        // Use sticky session — same IP for Admin API and browser login
-        const stickyResult = proxyService.getStickyProxyUrl();
-        proxyString = stickyResult.url;
-        proxyConfig = proxyService.getStickyProxy(stickyResult.sessionId);
+        // Use rotating proxy (sticky sessions dont work with Google)
+        proxyConfig = proxyService.getRotatingProxy();
+        proxyString = proxyService.getRotatingProxyUrl();
+        // sticky removed
 
-        await updateStep('CREATING', `Прокси получен (sticky: ${stickyResult.sessionId})`, { proxyUsed: proxyString });
+        await updateStep('CREATING', 'Прокси получен (rotating)', { proxyUsed: proxyString });
       } else if (hasLegacyProxy) {
         const proxyService = getProxyService(settings);
         proxyString = await proxyService.getProxy({ country: 'US', type: 'residential' });
@@ -397,12 +399,19 @@ export class AccountCreationFullService {
       const gwService = await createWorkspaceService(workspace, proxyString);
       const defaultPassword = settings?.defaultPassword || 'ChangeMe123!';
 
+      // Recovery email will be added via browser, NOT via API
+      // This is important - adding via browser looks more "natural" to Google
       const googleAccount = await gwService.createUser(
         workspace.domain,
         defaultPassword,
-        workspace.recoveryEmail?.email
+        null // Recovery email добавляется ТОЛЬКО через браузер!
       );
       stepDurations.googleApi = Date.now() - googleStart;
+
+      // Задержка 30-60 секунд перед браузерной авторизацией (по ТЗ)
+      const delay = 30000 + Math.random() * 30000;
+      console.log('Ожидание ' + Math.round(delay/1000) + ' сек перед входом в браузер...');
+      await this.sleep(delay);
 
       await updateStep('BROWSER_AUTH', 'Аккаунт создан, запуск браузера', {
         email: googleAccount.email
@@ -425,6 +434,9 @@ export class AccountCreationFullService {
         await updateStep('BROWSER_AUTH', 'Авторизация в Google');
 
         const loginStart = Date.now();
+        // Warm up browser before Google login to avoid phone verification
+        console.log("Warming up browser profile...");
+        await browser.warmUp(60);
         await browser.loginGoogle(googleAccount.email, defaultPassword);
         stepDurations.login = Date.now() - loginStart;
 
