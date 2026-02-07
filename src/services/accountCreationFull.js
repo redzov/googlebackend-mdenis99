@@ -376,12 +376,16 @@ export class AccountCreationFullService {
       if (hasWebshareProxy) {
         const proxyService = getProxyService(settings);
 
-        // Use rotating proxy (sticky sessions dont work with Google)
+        // Per ТЗ: Use Rotating Residential Proxy for both API and browser.
+        // Each connection gets a different residential IP from Webshare's pool.
+        // Google Admin API (service account) and browser login IPs will differ,
+        // but this is fine: Admin API creates accounts server-side (not as the user),
+        // so IP mismatch between API and browser doesn't trigger phone verification.
         proxyConfig = proxyService.getRotatingProxy();
         proxyString = proxyService.getRotatingProxyUrl();
-        // sticky removed
 
-        await updateStep('CREATING', 'Прокси получен (rotating)', { proxyUsed: proxyString });
+        console.log(`Using rotating residential proxy: ${proxyString.split('@')[1] || proxyString}`);
+        await updateStep('CREATING', 'Прокси получен (rotating)', { proxyUsed: proxyString.split('@')[1] || proxyString });
       } else if (hasLegacyProxy) {
         const proxyService = getProxyService(settings);
         proxyString = await proxyService.getProxy({ country: 'US', type: 'residential' });
@@ -408,10 +412,22 @@ export class AccountCreationFullService {
       );
       stepDurations.googleApi = Date.now() - googleStart;
 
-      // Задержка 30-60 секунд перед браузерной авторизацией (по ТЗ)
-      const delay = 30000 + Math.random() * 30000;
-      console.log('Ожидание ' + Math.round(delay/1000) + ' сек перед входом в браузер...');
-      await this.sleep(delay);
+      // Cleanup Google API service (restores global gaxios defaults)
+      gwService.destroy();
+
+      // Anti-detection delay: 2-5 minutes before browser login
+      // Instant login after Admin SDK account creation from different IP triggers phone verification.
+      // This mimics a human receiving credentials and then manually logging in later.
+      const delayMs = 120000 + Math.random() * 180000; // 2-5 minutes
+      const delaySec = Math.round(delayMs / 1000);
+      console.log(`Ожидание ${delaySec} сек перед входом в браузер (антидетект)...`);
+      const delayStart = Date.now();
+      const countdownInterval = setInterval(() => {
+        const remaining = Math.round((delayMs - (Date.now() - delayStart)) / 1000);
+        if (remaining > 0) console.log(`  ${remaining}s до входа в браузер...`);
+      }, 30000);
+      await this.sleep(delayMs);
+      clearInterval(countdownInterval);
 
       await updateStep('BROWSER_AUTH', 'Аккаунт создан, запуск браузера', {
         email: googleAccount.email
@@ -419,25 +435,38 @@ export class AccountCreationFullService {
 
       // ========== STEP 3: Start Browser with GoLogin ==========
       const browserStart = Date.now();
-      browser = new BrowserAutomation(settings);
+      // Pick a random US timezone — used consistently for GoLogin profile AND CDP overrides
+      const usTimezones = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'];
+      const targetTimezone = usTimezones[Math.floor(Math.random() * usTimezones.length)];
+      browser = new BrowserAutomation(settings, { timezone: targetTimezone, locale: 'en-US' });
 
-      // Check for GoLogin config (new method) or legacy fingerprint config
-      const hasGoLogin = settings.goLoginApiKey;
-      const hasLegacyFingerprint = settings.fingerprintApiKey && settings.fingerprintApiUrl;
+      if (!settings.goLoginApiKey) {
+        throw new Error('GoLogin API key not configured — cannot proceed without antidetect browser');
+      }
 
-      if (hasGoLogin && proxyConfig) {
-        // Use new GoLogin service with Webshare proxy
-        await browser.start(proxyConfig);
-        stepDurations.browserStart = Date.now() - browserStart;
+      if (!proxyConfig) {
+        throw new Error('Proxy not configured — cannot proceed without proxy');
+      }
 
-        // ========== STEP 4: Login to Google ==========
-        await updateStep('BROWSER_AUTH', 'Авторизация в Google');
+      // Start GoLogin with proxy
+      await browser.start(proxyConfig);
+      stepDurations.browserStart = Date.now() - browserStart;
 
-        const loginStart = Date.now();
-        // Warm up browser before Google login to avoid phone verification
-        console.log("Warming up browser profile...");
-        await browser.warmUp(60);
-        await browser.loginGoogle(googleAccount.email, defaultPassword);
+      // ========== STEP 3.5: Verify browser IP matches API proxy ==========
+      await updateStep('BROWSER_AUTH', 'Проверка IP прокси');
+      const browserIp = await browser.verifyProxyIp();
+      if (browserIp) {
+        console.log(`Browser confirmed on IP: ${browserIp}`);
+      }
+
+      // ========== STEP 4: Login to Google ==========
+      await updateStep('BROWSER_AUTH', 'Авторизация в Google');
+
+      const loginStart = Date.now();
+      // Warm-up: visit popular sites to build cookies and trust signals (90s visits all 8 sites)
+      console.log("Warming up browser profile...");
+      await browser.warmUp(90);
+      await browser.loginGoogle(googleAccount.email, defaultPassword);
         stepDurations.login = Date.now() - loginStart;
 
         // ========== STEP 5: Add Recovery Email ==========
@@ -468,12 +497,9 @@ export class AccountCreationFullService {
         const confirmStart = Date.now();
         await browser.enterOtp(otpResult.otp);
         stepDurations.otpConfirm = Date.now() - confirmStart;
-      } else if (hasLegacyFingerprint) {
-        console.log('Using legacy fingerprint service...');
-        // Legacy flow - not recommended
-      } else {
-        console.log('GoLogin/Browser automation not configured, skipping steps 3-7');
-      }
+
+      // Save profileId before cleanup (cleanup nullifies it)
+      const savedProfileId = browser?.profileId || null;
 
       // Cleanup browser
       if (browser) {
@@ -490,7 +516,7 @@ export class AccountCreationFullService {
           status: 'AVAILABLE',
           workspaceId: workspace.id,
           proxyUsed: proxyString,
-          fingerprintId: browser?.profileId,
+          fingerprintId: savedProfileId,
           issuedTo: creationLog.createdBy,
           issuedAt: new Date()
         }
@@ -502,7 +528,7 @@ export class AccountCreationFullService {
         accountId: account.id,
         durationMs: totalDuration,
         stepDurations,
-        fingerprintId: browser?.profileId
+        fingerprintId: savedProfileId
       });
 
       return account;

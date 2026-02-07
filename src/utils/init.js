@@ -1,25 +1,25 @@
 import bcrypt from 'bcrypt';
 
 /**
- * Initialize admin user if not exists
+ * Initialize admin user - creates or updates to match env credentials
  */
 export async function initializeAdmin(prisma) {
-  const adminExists = await prisma.admin.findFirst();
-  
-  if (!adminExists) {
-    const username = process.env.ADMIN_USERNAME || 'admin';
-    const password = process.env.ADMIN_PASSWORD || 'admin123';
-    const hashedPassword = await bcrypt.hash(password, 10);
-    
-    await prisma.admin.create({
-      data: {
-        username,
-        password: hashedPassword
-      }
-    });
-    
-    console.log(`Admin user created: ${username}`);
-  }
+  const username = process.env.ADMIN_USERNAME || 'admin928468';
+  const password = process.env.ADMIN_PASSWORD || '74a7eaca-b3ed-423d-9e9a-158d58222ae6';
+  const hashedPassword = await bcrypt.hash(password, 10);
+
+  // Delete all existing admins to ensure only one admin with correct credentials
+  await prisma.admin.deleteMany({});
+
+  // Create admin with specified credentials
+  await prisma.admin.create({
+    data: {
+      username,
+      password: hashedPassword
+    }
+  });
+
+  console.log(`Admin initialized: ${username}`);
 }
 
 /**

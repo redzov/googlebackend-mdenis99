@@ -1,7 +1,8 @@
 import { google } from 'googleapis';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import Gaxios from 'gaxios';
-import { generateEmailUsername } from '../utils/generators.js';
+import { generateEmailUsername, generateRealName } from '../utils/generators.js';
 
 /**
  * Google Workspace Account Creation Service
@@ -22,17 +23,35 @@ export class GoogleWorkspaceService {
    */
   async initialize() {
     try {
-      const credentials = typeof this.serviceAccountJson === 'string'
-        ? JSON.parse(this.serviceAccountJson)
-        : this.serviceAccountJson;
+      let credentials;
+      if (typeof this.serviceAccountJson === 'string') {
+        try {
+          credentials = JSON.parse(this.serviceAccountJson);
+        } catch (parseError) {
+          // Fix: service account JSON may have literal newlines inside private_key PEM
+          // This happens when JSON is stored with real \n instead of escaped \\n
+          const fixed = this.serviceAccountJson.replace(
+            /("private_key"\s*:\s*")([\s\S]*?)(")/,
+            (match, prefix, key, suffix) => prefix + key.replace(/\n/g, '\\n') + suffix
+          );
+          credentials = JSON.parse(fixed);
+        }
+      } else {
+        credentials = this.serviceAccountJson;
+      }
 
-      // Create proxy agent and set gaxios defaults
+      // Create proxy agent (SOCKS5 or HTTP) and set gaxios defaults
       if (this.proxyUrl) {
-        this.proxyAgent = new HttpsProxyAgent(this.proxyUrl);
+        if (this.proxyUrl.startsWith('socks')) {
+          this.proxyAgent = new SocksProxyAgent(this.proxyUrl);
+          console.log(`Google API will route through SOCKS proxy: ${this.proxyUrl.split('@')[1] || this.proxyUrl}`);
+        } else {
+          this.proxyAgent = new HttpsProxyAgent(this.proxyUrl);
+          console.log(`Google API will route through HTTP proxy: ${this.proxyUrl.split('@')[1] || this.proxyUrl}`);
+        }
         // Save original defaults and set proxy agent globally for gaxios
         this._originalGaxiosDefaults = { ...Gaxios.instance.defaults };
         Gaxios.instance.defaults.agent = this.proxyAgent;
-        console.log(`Google API will route through proxy: ${this.proxyUrl.split('@')[1] || this.proxyUrl}`);
       }
 
       // Use JWT directly with subject for domain-wide delegation
@@ -51,14 +70,24 @@ export class GoogleWorkspaceService {
       // Authorize the JWT client (will use gaxios defaults with proxy)
       await this.auth.authorize();
 
-      // Create admin directory client
-      this.admin = google.admin({
+      // Create admin directory client with proxy support
+      const adminOptions = {
         version: 'directory_v1',
         auth: this.auth
-      });
+      };
 
-      // Restore gaxios defaults after initialization
-      this._restoreGaxiosDefaults();
+      // If proxy is configured, pass the agent to all API calls
+      if (this.proxyAgent) {
+        adminOptions.http_options = {
+          agent: this.proxyAgent
+        };
+      }
+
+      this.admin = google.admin(adminOptions);
+
+      // Note: We do NOT restore gaxios defaults here anymore
+      // The proxy should remain active for all API calls
+      // It will be restored when destroy() is called
 
       return true;
     } catch (error) {
@@ -83,6 +112,16 @@ export class GoogleWorkspaceService {
   }
 
   /**
+   * Cleanup and restore defaults - call when done with this service instance
+   */
+  destroy() {
+    this._restoreGaxiosDefaults();
+    this.admin = null;
+    this.auth = null;
+    this.proxyAgent = null;
+  }
+
+  /**
    * Create a new user account in Google Workspace
    */
   async createUser(domain, password, recoveryEmail = null) {
@@ -90,6 +129,7 @@ export class GoogleWorkspaceService {
       await this.initialize();
     }
 
+    const realName = generateRealName();
     const username = generateEmailUsername();
     const email = `${username}@${domain}`;
 
@@ -97,8 +137,8 @@ export class GoogleWorkspaceService {
       const userResource = {
         primaryEmail: email,
         name: {
-          givenName: 'User',
-          familyName: username
+          givenName: realName.givenName,
+          familyName: realName.familyName
         },
         password: password,
         changePasswordAtNextLogin: false,

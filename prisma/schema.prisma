@@ -75,15 +75,6 @@ model Workspace {
   serviceAccountJson String? @db.Text
   adminEmail         String? // Admin email for domain-wide delegation
 
-  // Static Proxy for Admin API (one IP per workspace)
-  // This proxy is used for creating accounts via Google Admin API
-  // Each workspace should have its own dedicated static IP
-  staticProxyHost     String?
-  staticProxyPort     Int?
-  staticProxyUsername String?
-  staticProxyPassword String?
-  staticProxyProtocol String?  @default("http") // http, socks5
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

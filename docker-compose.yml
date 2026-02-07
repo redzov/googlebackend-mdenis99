@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL Database
   postgres:
@@ -46,9 +44,13 @@ services:
       PORT: 3000
       HOST: 0.0.0.0
       JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-change-me-in-production}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin928468}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-74a7eaca-b3ed-423d-9e9a-158d58222ae6}
       NODE_ENV: production
       # GoLogin will download Orbita browser automatically
-      GOLOGIN_HEADLESS: "true"
+      # Use xvfb instead of headless to avoid detection
+      GOLOGIN_HEADLESS: "false"
+      DISPLAY: ":99"
     ports:
       - "3000:3000"
     depends_on:
@@ -71,7 +73,7 @@ services:
     container_name: gw_frontend
     working_dir: /app
     environment:
-      VITE_API_URL: http://localhost:3000
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
     ports:
       - "5173:5173"
     volumes:

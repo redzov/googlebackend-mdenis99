@@ -41,7 +41,7 @@ function getChromePath() {
 }
 
 export class BrowserAutomation {
-  constructor(settings) {
+  constructor(settings, options = {}) {
     this.settings = settings;
     this.goLoginService = null;
     this.goLoginInstance = null; // GL instance for stop()
@@ -49,6 +49,9 @@ export class BrowserAutomation {
     this.browser = null;
     this.page = null;
     this.mode = null; // 'gologin' or 'fallback'
+    // Target locale/timezone for CDP overrides (prevents SDK language mismatch)
+    this.targetTimezone = options.timezone || 'America/New_York';
+    this.targetLocale = options.locale || 'en-US';
   }
 
   /**
@@ -64,24 +67,17 @@ export class BrowserAutomation {
 
   /**
    * Start browser with GoLogin profile and proxy
-   * Falls back to regular Puppeteer if GoLogin fails (e.g., on macOS dev)
+   * NEVER falls back to raw Puppeteer — it has zero antidetect protection
+   * and guarantees phone verification from Google.
    * @param {object} proxy - Proxy config { mode, host, port, username, password }
    * @returns {Promise<Page>} - Puppeteer page instance
    */
   async start(proxy) {
-    // Try GoLogin first
-    if (this.settings.goLoginApiKey) {
-      try {
-        return await this.startWithGoLogin(proxy);
-      } catch (error) {
-        console.warn(`GoLogin failed: ${error.message}`);
-        console.log('Falling back to regular Puppeteer...');
-      }
+    if (!this.settings.goLoginApiKey) {
+      throw new Error('GoLogin API key not configured. Cannot proceed without antidetect browser — raw Puppeteer will trigger phone verification.');
     }
 
-    // Fallback to regular Puppeteer
-    // If proxy requires authentication, use proxy-chain to create a local forwarder
-    return await this.startWithFallback(proxy);
+    return await this.startWithGoLogin(proxy);
   }
 
   /**
@@ -140,6 +136,37 @@ export class BrowserAutomation {
 
     console.log(`Browser started (GoLogin ${profileMode} mode)`);
     return this.page;
+  }
+
+  /**
+   * Verify that the browser is using the expected proxy IP.
+   * Compares browser's visible IP with the IP seen by Google API.
+   * @param {string|null} expectedIp - Expected IP from API call (or null to just log)
+   * @returns {Promise<string>} - The browser's public IP
+   */
+  async verifyProxyIp(expectedIp = null) {
+    try {
+      console.log('Verifying browser proxy IP...');
+      await this.page.goto('https://api.ipify.org?format=json', {
+        waitUntil: 'networkidle2',
+        timeout: 15000
+      });
+      const body = await this.page.evaluate(() => document.body?.innerText || '');
+      const data = JSON.parse(body);
+      const browserIp = data.ip;
+
+      if (expectedIp && browserIp !== expectedIp) {
+        console.error(`IP MISMATCH! API IP: ${expectedIp}, Browser IP: ${browserIp}`);
+        throw new Error(`Proxy IP mismatch: API used ${expectedIp} but browser sees ${browserIp}. This WILL trigger phone verification.`);
+      }
+
+      console.log(`Browser IP verified: ${browserIp}${expectedIp ? ' (matches API)' : ''}`);
+      return browserIp;
+    } catch (error) {
+      if (error.message.includes('Proxy IP mismatch')) throw error;
+      console.warn(`Could not verify proxy IP: ${error.message}`);
+      return null;
+    }
   }
 
   /**
@@ -207,12 +234,27 @@ export class BrowserAutomation {
   }
 
   /**
-   * Configure page for stealth
+   * Configure page for stealth + force language/timezone via CDP
+   * This is the NUCLEAR override that fixes GoLogin SDK's IP-based language detection.
+   * The SDK writes wrong language/timezone to Chrome Preferences based on rotating proxy IP,
+   * but CDP overrides take absolute precedence over Preferences file settings.
    */
   async configurePage() {
-    // Remove webdriver flag
-    await this.page.evaluateOnNewDocument(() => {
+    // 1. Force Accept-Language header on ALL HTTP requests
+    // This overrides whatever GoLogin SDK wrote to intl.accept_languages in Preferences
+    await this.page.setExtraHTTPHeaders({
+      'Accept-Language': `${this.targetLocale},en;q=0.9`
+    });
+
+    // 2. Override navigator properties + webdriver flag
+    const locale = this.targetLocale;
+    await this.page.evaluateOnNewDocument((loc) => {
+      // Remove webdriver flag
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+      // Force language properties to match our target locale
+      Object.defineProperty(navigator, 'language', { get: () => loc });
+      Object.defineProperty(navigator, 'languages', { get: () => [loc, 'en'] });
 
       // Override permissions
       const originalQuery = window.navigator.permissions.query;
@@ -220,7 +262,22 @@ export class BrowserAutomation {
         parameters.name === 'notifications'
           ? Promise.resolve({ state: Notification.permission })
           : originalQuery(parameters);
-    });
+    }, locale);
+
+    // 3. Force timezone and locale via CDP (Chrome DevTools Protocol)
+    try {
+      const cdpSession = await this.page.createCDPSession();
+      await cdpSession.send('Emulation.setTimezoneOverride', {
+        timezoneId: this.targetTimezone
+      });
+      await cdpSession.send('Emulation.setLocaleOverride', {
+        locale: this.targetLocale
+      });
+      console.log(`CDP overrides applied: timezone=${this.targetTimezone}, locale=${this.targetLocale}`);
+    } catch (cdpError) {
+      console.warn(`CDP override warning: ${cdpError.message}`);
+      // Non-fatal — evaluateOnNewDocument overrides still work
+    }
 
     // Set timeouts (longer for Cloud Browser due to network latency)
     const timeout = this.goLoginMode === 'cloud' ? 120000 : 60000;
@@ -304,7 +361,9 @@ export class BrowserAutomation {
         const buttons = Array.from(document.querySelectorAll('button'));
         for (const btn of buttons) {
           const text = (btn.textContent || '').toLowerCase();
-          if (text.includes('accept') || text.includes('agree') || text.includes('принять') || text.includes('согласен')) {
+          if (text.includes('accept all') || text.includes('accept') || text.includes('agree') ||
+              text.includes('alle akzeptieren') || text.includes('akzeptieren') ||
+              text.includes('принять') || text.includes('согласен')) {
             btn.click();
             break;
           }
@@ -339,45 +398,81 @@ export class BrowserAutomation {
   async loginGoogle(email, password) {
     console.log(`Logging in to Google as ${email}...`);
 
-    // Navigate directly to security page - this may avoid phone verification
-    // and is where we need to add recovery email anyway
-    await this.page.goto('https://myaccount.google.com/intro/security', {
+    // Natural login flow: visit google.com first, then click "Sign in"
+    // Direct accounts.google.com navigation is an automation signal
+    await this.page.goto('https://www.google.com/', {
       waitUntil: 'networkidle2',
       timeout: 60000
     });
+    await this.sleep(1500 + Math.random() * 2000);
 
-    // Check if we're on intro page (not logged in) - need to click "Sign in" button
+    // Try to click the "Sign in" button/link on google.com
+    const signInClicked = await this.page.evaluate(() => {
+      // Method 1: Standard sign-in link (href contains accounts.google.com)
+      const signInLink = document.querySelector('a[href*="accounts.google.com/ServiceLogin"], a[href*="accounts.google.com/signin"], a[data-pid="23"]');
+      if (signInLink) { signInLink.click(); return 'link'; }
+      // Method 2: Find by text content
+      const links = Array.from(document.querySelectorAll('a'));
+      const byText = links.find(a => {
+        const text = (a.textContent || '').trim().toLowerCase();
+        return text === 'sign in' || text === 'войти' || text === 'anmelden' ||
+               text === 'connexion' || text === 'iniciar sesión' || text === 'accedi';
+      });
+      if (byText) { byText.click(); return 'text'; }
+      return null;
+    });
+
+    if (signInClicked) {
+      console.log(`  Clicked "Sign in" on google.com (method: ${signInClicked})`);
+      await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+      await this.sleep(1500 + Math.random() * 1000);
+    } else {
+      // Fallback: direct navigation (if google.com layout changed)
+      console.log('  Sign in button not found, navigating directly to accounts.google.com');
+      await this.page.goto('https://accounts.google.com/', {
+        waitUntil: 'networkidle2',
+        timeout: 60000
+      });
+      await this.sleep(1000 + Math.random() * 1000);
+    }
+
+    // Handle cookie consent or intermediate pages before login form
     const currentUrl = this.page.url();
-    if (currentUrl.includes('/intro/')) {
-      console.log('On intro page, clicking "Sign in" button...');
+    console.log(`  Pre-login URL: ${currentUrl}`);
 
-      // Click "Sign in" / "Войти в аккаунт" button
-      const clicked = await this.page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll('a, button'));
-        const signInKeywords = ['sign in', 'войти', 'вход', 'sign-in', 'signin', 'log in', 'login'];
-
-        for (const el of links) {
-          const text = (el.textContent || '').toLowerCase().trim();
-          const href = (el.href || '').toLowerCase();
-
-          if (signInKeywords.some(kw => text.includes(kw)) || href.includes('signin') || href.includes('login')) {
-            const rect = el.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) {
-              el.click();
-              return true;
-            }
+    // If we're not on accounts.google.com yet, handle consent/redirect
+    if (!currentUrl.includes('accounts.google.com')) {
+      console.log('  Not on accounts.google.com yet, handling intermediate page...');
+      // Accept cookies if consent dialog appears
+      await this.page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        for (const btn of buttons) {
+          const text = (btn.textContent || '').toLowerCase();
+          if (text.includes('accept all') || text.includes('accept') || text.includes('agree') ||
+              text.includes('alle akzeptieren') || text.includes('принять') ||
+              text.includes('accetta') || text.includes('aceptar')) {
+            btn.click();
+            return true;
           }
         }
         return false;
       });
+      await this.sleep(2000);
 
-      if (clicked) {
-        await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-        await this.sleep(1000);
+      // If still not on accounts.google.com, navigate directly
+      const urlAfterConsent = this.page.url();
+      if (!urlAfterConsent.includes('accounts.google.com')) {
+        console.log('  Navigating directly to accounts.google.com as fallback');
+        await this.page.goto('https://accounts.google.com/', {
+          waitUntil: 'networkidle2',
+          timeout: 60000
+        });
+        await this.sleep(1000 + Math.random() * 1000);
       }
     }
 
-    // Wait for and enter email
+    // Wait for email input (may appear after redirect/consent handling)
+    console.log(`  Waiting for email input on: ${this.page.url()}`);
     await this.page.waitForSelector('input[type="email"]', { timeout: 30000 });
     await this.sleep(500);
     await this.humanType('input[type="email"]', email);
@@ -634,22 +729,13 @@ export class BrowserAutomation {
             const altPageText = await this.page.evaluate(() => document.body?.innerText || '').catch(() => '');
             console.log(`Alternative methods page: ${altPageText.substring(0, 300).replace(/\n/g, ' | ')}`);
 
-            // Return challenge info so caller can handle email verification + OTP
-            return {
-              success: false,
-              challenge: 'phone_verification',
-              altMethodsClicked: true,
-              pageText: altPageText.substring(0, 1000)
-            };
+            // Phone verification is a blocker - throw error so caller can handle it
+            throw new Error(`PHONE_VERIFICATION: Google requires phone verification. Alternative methods page shown. This usually means IP mismatch between account creation and login. Page: ${altPageText.substring(0, 200)}`);
           } else {
             console.log('Could not find "Try another way" link');
+            await this.screenshot(`phone_verify_no_alt_${attempt}`);
 
-            // Return challenge info without alt methods
-            return {
-              success: false,
-              challenge: 'phone_verification',
-              altMethodsClicked: false
-            };
+            throw new Error('PHONE_VERIFICATION: Google requires phone verification and no alternative methods found. This usually means the IP, browser fingerprint, or account metadata triggered Google\'s fraud detection.');
           }
         }
 

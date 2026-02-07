@@ -28,7 +28,13 @@ try {
 export class GoLoginService {
   constructor(settings) {
     this.apiToken = settings.goLoginApiKey;
-    this.useHeadless = process.env.GOLOGIN_HEADLESS === 'true' || settings.goLoginHeadless;
+    // Environment variable takes precedence over settings
+    // GOLOGIN_HEADLESS=false disables headless even if settings.goLoginHeadless is true
+    if (process.env.GOLOGIN_HEADLESS !== undefined) {
+      this.useHeadless = process.env.GOLOGIN_HEADLESS === 'true';
+    } else {
+      this.useHeadless = settings.goLoginHeadless ?? true;
+    }
 
     if (!this.apiToken) {
       throw new Error('GoLogin API token not configured. Set goLoginApiKey in settings.');
@@ -98,21 +104,38 @@ export class GoLoginService {
 
   /**
    * Create a new browser profile with proxy
-   * @param {object} proxy - Proxy config { mode, host, port, username, password }
+   * @param {object} proxy - Proxy config { mode, host, port, username, password, countryCode }
    * @param {string} name - Profile name
    * @returns {Promise<string>} - Profile ID
    */
   async createProfile(proxy, name = `account_${Date.now()}`) {
-    // Minimal profile config - GoLogin API is strict about field formats
+    // Common resolutions for residential users
+    const resolutions = ['1920x1080', '1366x768', '1536x864', '1440x900', '1600x900'];
+    const resolution = resolutions[Math.floor(Math.random() * resolutions.length)];
+
+    // IMPORTANT: fillBasedOnIp is INCOMPATIBLE with rotating proxy!
+    // Each proxy request gets a different IP, so GoLogin's IP check during startup
+    // may get Italian IP → sets lang=it-IT, then browser actually uses US IP → MISMATCH.
+    // Solution: set ALL values explicitly for US English speaker (45/100 IPs are US).
+    const browserLanguage = 'en-US,en;q=0.9';
+
+    // Random US timezone from common ones
+    const usTimezones = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'];
+    const timezone = usTimezones[Math.floor(Math.random() * usTimezones.length)];
+
     const profileConfig = {
       name,
       browserType: 'chrome',
-      os: 'lin',
+      // Windows — residential proxy users are home users, not Linux servers
+      os: 'win',
+      // Prevent SDK from overriding language based on proxy IP during startup
+      autoLang: false,
       navigator: {
-        language: 'en-US',
-        platform: 'Linux x86_64',
-        userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        resolution: '1920x1080'
+        language: browserLanguage,
+        platform: 'Win32',
+        // Updated: 2026-02 — review quarterly. Use version 1-2 behind latest stable.
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+        resolution
       },
       proxy: {
         mode: proxy.mode || 'socks5',
@@ -120,6 +143,50 @@ export class GoLoginService {
         port: parseInt(proxy.port) || 80,
         username: proxy.username || '',
         password: proxy.password || ''
+      },
+      // WebRTC: mask real IP. fillBasedOnIp MUST be false with rotating proxy —
+      // otherwise SDK checks IP, gets random IP-A, but browser uses IP-B → mismatch
+      webRTC: {
+        mode: 'alerted',
+        enabled: true,
+        customize: true,
+        fillBasedOnIp: false
+      },
+      // Timezone: explicit US timezone (fillBasedOnIp broken with rotating proxy)
+      timezone: {
+        enabled: true,
+        fillBasedOnIp: false,
+        timezone: timezone
+      },
+      // Geolocation: disabled — don't share location (avoids mismatch with rotating IP)
+      geolocation: {
+        mode: 'block',
+        enabled: true,
+        customize: false,
+        fillBasedOnIp: false
+      },
+      // Canvas: use noise to make fingerprint unique but consistent
+      canvas: {
+        mode: 'noise'
+      },
+      // WebGL: noise-based fingerprint
+      webGL: {
+        mode: 'noise'
+      },
+      // WebGL metadata: mask real GPU info
+      webGLMetadata: {
+        mode: 'mask',
+        vendor: 'Google Inc. (Intel)',
+        renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.5)'
+      },
+      // Audio context fingerprint
+      audioContext: {
+        mode: 'noise'
+      },
+      // Media devices: realistic device count
+      mediaDevices: {
+        enableMasking: true,
+        uid: crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
       }
     };
 
@@ -140,56 +207,54 @@ export class GoLoginService {
 
   /**
    * Start a browser profile and get browser instance
-   * Priority depends on environment:
-   * - Local (GOLOGIN_HEADLESS=false): SDK first (uses GoLogin Desktop)
-   * - Server/Docker (GOLOGIN_HEADLESS=true): Cloud Browser first
+   * Priority: SDK (with local Orbita) > Cloud Browser > API
+   * SDK is preferred because it provides better fingerprinting control
    * @param {string} profileId - Profile ID
    * @returns {Promise<object>} - { browser, wsUrl, GL, profileId }
    */
   async startProfile(profileId) {
-    // Check if running in local mode (with GoLogin Desktop)
-    const isLocalMode = process.env.GOLOGIN_HEADLESS === 'false' || !this.useHeadless;
+    const errors = [];
 
-    if (isLocalMode) {
-      // LOCAL MODE: Try SDK first (GoLogin Desktop provides Orbita)
-      console.log('Running in local mode - trying SDK with GoLogin Desktop...');
-
-      if (this.isSDKAvailable()) {
-        try {
-          return await this.startProfileSDK(profileId);
-        } catch (error) {
-          console.warn('SDK mode failed:', error.message);
-        }
-      }
-
-      // Fallback to Cloud Browser
+    // 1. Always try SDK first (best fingerprinting, works in Docker with Orbita)
+    if (this.isSDKAvailable()) {
+      console.log('Trying SDK mode (local Orbita browser)...');
       try {
-        return await this.startProfileCloud(profileId);
+        const result = await this.startProfileSDK(profileId);
+        console.log('SDK mode started successfully!');
+        return result;
       } catch (error) {
-        console.warn('Cloud Browser mode failed:', error.message);
+        console.warn('SDK mode failed:', error.message);
+        errors.push(`SDK: ${error.message}`);
       }
     } else {
-      // SERVER MODE: Try Cloud Browser first (no local Orbita available)
-      console.log('Running in server mode - trying Cloud Browser...');
-
-      try {
-        return await this.startProfileCloud(profileId);
-      } catch (error) {
-        console.warn('Cloud Browser mode failed:', error.message);
-      }
-
-      // Fallback to SDK (if Orbita somehow available)
-      if (this.isSDKAvailable()) {
-        try {
-          return await this.startProfileSDK(profileId);
-        } catch (error) {
-          console.warn('SDK mode failed:', error.message);
-        }
-      }
+      console.log('SDK not available, skipping...');
+      errors.push('SDK: not available');
     }
 
-    // Last resort: API mode (requires GoLogin Desktop running)
-    return await this.startProfileAPI(profileId);
+    // 2. Try Cloud Browser (runs browser on GoLogin servers)
+    console.log('Trying Cloud Browser mode...');
+    try {
+      const result = await this.startProfileCloud(profileId);
+      console.log('Cloud Browser mode started successfully!');
+      return result;
+    } catch (error) {
+      console.warn('Cloud Browser mode failed:', error.message);
+      errors.push(`Cloud: ${error.message}`);
+    }
+
+    // 3. Last resort: API mode (requires GoLogin Desktop running locally)
+    console.log('Trying API mode (requires GoLogin Desktop)...');
+    try {
+      const result = await this.startProfileAPI(profileId);
+      console.log('API mode started successfully!');
+      return result;
+    } catch (error) {
+      console.warn('API mode failed:', error.message);
+      errors.push(`API: ${error.message}`);
+    }
+
+    // All modes failed
+    throw new Error(`All GoLogin modes failed: ${errors.join('; ')}`);
   }
 
   /**
@@ -229,29 +294,70 @@ export class GoLoginService {
    */
   async startProfileSDK(profileId) {
     console.log(`Starting GoLogin profile (SDK mode): ${profileId}`);
+    console.log(`  Headless mode: ${this.useHeadless}`);
+    console.log(`  GOLOGIN_DATA_PATH: ${process.env.GOLOGIN_DATA_PATH || 'not set'}`);
+    console.log(`  GOLOGIN_BROWSER_PATH: ${process.env.GOLOGIN_BROWSER_PATH || 'not set'}`);
 
-    const extraParams = this.useHeadless ? ['--headless=new'] : [];
-
-    const GL = new GoLoginSDK({
-      token: this.apiToken,
-      profile_id: profileId,
-      extra_params: extraParams
-    });
-
-    const { status, wsUrl } = await GL.start();
-
-    if (!wsUrl) {
-      throw new Error(`Failed to start profile: ${status || 'no wsUrl returned'}`);
+    // --no-sandbox is REQUIRED when running as root in Docker (even without headless)
+    // extra_params override SDK's Chrome flags (--lang, --tz)
+    const usTimezones = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'];
+    const tz = usTimezones[Math.floor(Math.random() * usTimezones.length)];
+    const extraParams = [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      `--lang=en-US`,
+      `--tz=${tz}`,
+      `--accept-lang=en-US,en;q=0.9`
+    ];
+    if (this.useHeadless) {
+      extraParams.unshift('--headless=new');
     }
+    console.log(`  Extra params: ${extraParams.join(', ')}`);
 
-    console.log(`GoLogin profile started (SDK): ${profileId}`);
+    try {
+      // CRITICAL: Pass `timezone` object to SDK constructor.
+      // When options.timezone is set, SDK's getTimeZone() returns immediately
+      // WITHOUT making HTTP request to geo.myip.link through the rotating proxy.
+      // This prevents the SDK from detecting wrong country/language from random proxy IP.
+      const GL = new GoLoginSDK({
+        token: this.apiToken,
+        profile_id: profileId,
+        extra_params: extraParams,
+        skipOrbitaHashRecalculation: true,
+        autoUpdateBrowser: true,
+        timezone: {
+          timezone: tz,
+          country: 'US',
+          languages: 'en',
+          ip: '0.0.0.0',
+          ll: [40.7128, -74.0060],
+          accuracy: 100
+        }
+      });
 
-    return {
-      wsUrl,
-      GL,
-      profileId,
-      mode: 'sdk'
-    };
+      console.log('  GoLogin SDK instance created, calling start()...');
+      const startResult = await GL.start();
+      console.log('  GoLogin SDK start() result:', JSON.stringify(startResult));
+
+      const { status, wsUrl } = startResult;
+
+      if (!wsUrl) {
+        throw new Error(`Failed to start profile: ${status || 'no wsUrl returned'}`);
+      }
+
+      console.log(`GoLogin profile started (SDK): ${profileId}`);
+      console.log(`  WebSocket URL: ${wsUrl.substring(0, 50)}...`);
+
+      return {
+        wsUrl,
+        GL,
+        profileId,
+        mode: 'sdk'
+      };
+    } catch (error) {
+      console.error(`SDK start failed: ${error.message}`);
+      console.error(`SDK error stack: ${error.stack}`);
+      throw error;
+    }
   }
 
   /**

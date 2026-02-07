@@ -64,16 +64,23 @@ export class ProxyService {
   /**
    * Get Webshare proxy with sticky session (same IP for all requests with same session ID)
    * Webshare sticky sessions: append -sessid-XXX to username
+   * Webshare country targeting: append -country-XX to username
+   * Format: username-country-XX-sessid-YYY
    * @param {string} [sessionId] - Session ID. Auto-generated if not provided.
-   * @returns {object} - GoLogin format { mode, host, port, username, password, sessionId }
+   * @param {string} [countryCode] - ISO 2-letter country code (e.g. 'DE', 'FI', 'SE')
+   * @returns {object} - GoLogin format { mode, host, port, username, password, sessionId, countryCode }
    */
-  getStickyProxy(sessionId = null) {
+  getStickyProxy(sessionId = null, countryCode = null) {
     if (!this.isWebshareConfigured()) {
       throw new Error('Webshare proxy not configured');
     }
 
     const sid = sessionId || Math.random().toString(36).substring(2, 10);
-    const stickyUsername = `${this.username}-sessid-${sid}`;
+    let stickyUsername = this.username;
+    if (countryCode) {
+      stickyUsername += `-country-${countryCode.toUpperCase()}`;
+    }
+    stickyUsername += `-sessid-${sid}`;
 
     return {
       mode: this.protocol,
@@ -81,20 +88,23 @@ export class ProxyService {
       port: this.port,
       username: stickyUsername,
       password: this.password,
-      sessionId: sid
+      sessionId: sid,
+      countryCode: countryCode ? countryCode.toUpperCase() : null
     };
   }
 
   /**
    * Get Webshare sticky proxy as URL string
    * @param {string} [sessionId] - Session ID. Auto-generated if not provided.
-   * @returns {{ url: string, sessionId: string }}
+   * @param {string} [countryCode] - ISO 2-letter country code (e.g. 'DE', 'FI', 'SE')
+   * @returns {{ url: string, sessionId: string, countryCode: string|null }}
    */
-  getStickyProxyUrl(sessionId = null) {
-    const config = this.getStickyProxy(sessionId);
+  getStickyProxyUrl(sessionId = null, countryCode = null) {
+    const config = this.getStickyProxy(sessionId, countryCode);
     return {
       url: `${config.mode}://${config.username}:${config.password}@${config.host}:${config.port}`,
-      sessionId: config.sessionId
+      sessionId: config.sessionId,
+      countryCode: config.countryCode
     };
   }
 

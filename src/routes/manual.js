@@ -144,6 +144,92 @@ export default async function manualRoutes(fastify, options) {
     return content;
   });
 
+  // Simple endpoint - creates real accounts via Admin SDK only (no browser, no OTP)
+  fastify.post('/simple', {
+    preHandler: [fastify.authenticate]
+  }, async (request, reply) => {
+    const { workspaceId, count = 1 } = request.body;
+
+    if (!workspaceId) {
+      return reply.status(400).send({ error: 'Workspace ID required' });
+    }
+
+    const actualCount = Math.min(Math.max(1, parseInt(count)), 50);
+
+    const workspace = await prisma.workspace.findUnique({
+      where: { id: workspaceId },
+      include: { recoveryEmail: true }
+    });
+
+    if (!workspace) {
+      return reply.status(404).send({ error: 'Workspace not found' });
+    }
+
+    if (!workspace.serviceAccountJson || !workspace.adminEmail) {
+      return reply.status(400).send({
+        error: 'Workspace missing Google API credentials',
+        details: 'Configure serviceAccountJson and adminEmail'
+      });
+    }
+
+    const settings = await prisma.settings.findUnique({
+      where: { id: 'main' }
+    });
+
+    const defaultPassword = settings?.defaultPassword || 'ChangeMe123!';
+    const recoveryEmail = workspace.recoveryEmail?.email || null;
+
+    // Import and create Google Workspace service
+    const { createWorkspaceService } = await import('../services/googleWorkspace.js');
+    const gwService = await createWorkspaceService(workspace);
+
+    const accounts = [];
+    const errors = [];
+
+    for (let i = 0; i < actualCount; i++) {
+      try {
+        // Create user via Google Admin SDK
+        // Note: Recovery email NOT added via API - should be added via browser
+        const result = await gwService.createUser(
+          workspace.domain,
+          defaultPassword,
+          null // Recovery email will be added via browser, not API
+        );
+
+        // Save to database
+        const account = await prisma.account.create({
+          data: {
+            email: result.email,
+            password: defaultPassword,
+            recovery: recoveryEmail,
+            workspaceId: workspace.id,
+            status: 'AVAILABLE',
+            issuedTo: 'Manual',
+            issuedAt: new Date()
+          }
+        });
+
+        accounts.push(account);
+
+        // Small delay between creations
+        if (i < actualCount - 1) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+      } catch (error) {
+        errors.push({ index: i + 1, error: error.message });
+      }
+    }
+
+    return {
+      success: accounts.length > 0,
+      message: `Created ${accounts.length} account(s) via Admin SDK`,
+      created: accounts.length,
+      failed: errors.length,
+      accounts,
+      errors
+    };
+  });
+
   // Demo endpoint - creates fake accounts without Google API
   fastify.post('/demo', {
     preHandler: [fastify.authenticate]
@@ -197,6 +283,83 @@ export default async function manualRoutes(fastify, options) {
       message: `Created ${accounts.length} demo accounts`,
       accounts
     };
+  });
+
+  // Test browser login - tries to login to Google account via GoLogin + proxy
+  fastify.post('/test-login', {
+    preHandler: [fastify.authenticate]
+  }, async (request, reply) => {
+    const { email, password, workspaceId } = request.body;
+
+    if (!email || !password) {
+      return reply.status(400).send({ error: 'Email and password required' });
+    }
+
+    const settings = await prisma.settings.findUnique({
+      where: { id: 'main' }
+    });
+
+    if (!settings?.goLoginApiKey) {
+      return reply.status(400).send({ error: 'GoLogin not configured' });
+    }
+
+    // Get proxy from workspace if provided
+    let proxy = null;
+    if (workspaceId) {
+      const workspace = await prisma.workspace.findUnique({
+        where: { id: workspaceId }
+      });
+      if (workspace?.staticProxyHost) {
+        proxy = {
+          mode: workspace.staticProxyProtocol || 'http',
+          host: workspace.staticProxyHost,
+          port: workspace.staticProxyPort,
+          username: workspace.staticProxyUsername,
+          password: workspace.staticProxyPassword
+        };
+      }
+    }
+
+    const { BrowserAutomation } = await import('../services/browserAutomation.js');
+    const browser = new BrowserAutomation(settings);
+
+    try {
+      console.log(`Test login: ${email} via GoLogin${proxy ? ' + proxy' : ''}...`);
+
+      // Start browser with proxy
+      await browser.start(proxy);
+
+      // Optional warm-up (shorter for test)
+      // await browser.warmUp(30);
+
+      // Try to login
+      const result = await browser.loginGoogle(email, password);
+
+      // Get final URL and screenshot
+      const finalUrl = browser.getCurrentUrl();
+      await browser.screenshot('test_login_final');
+
+      return {
+        success: result === true,
+        message: result === true ? 'Login successful!' : 'Login returned challenge',
+        result,
+        finalUrl,
+        proxyUsed: proxy ? `${proxy.host}:${proxy.port}` : 'none',
+        mode: browser.mode
+      };
+
+    } catch (error) {
+      console.error('Test login failed:', error);
+      await browser.screenshot('test_login_error');
+
+      return reply.status(500).send({
+        success: false,
+        error: error.message,
+        proxyUsed: proxy ? `${proxy.host}:${proxy.port}` : 'none'
+      });
+    } finally {
+      await browser.cleanup();
+    }
   });
 
   // Get service status (check external APIs)
